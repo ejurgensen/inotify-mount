@@ -3,189 +3,189 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <libmount/libmount.h>
 
-#ifdef __linux__
-#include <sys/inotify.h>
-#include <mntent.h>
-#elif defined(__FreeBSD__)
-#include <sys/types.h>
-#include <sys/event.h>
-#include <sys/time.h>
-#include <sys/mount.h>
-#include <fcntl.h>
-#endif
-
-#define EVENT_SIZE (sizeof(struct inotify_event))
-#define EVENT_BUF_LEN (1024 * (EVENT_SIZE + 16))
-
-#ifdef __linux__
-void print_mounts() {
-    FILE *fp;
-    struct mntent *mnt;
+// Function to print mount information
+void print_mount_info(struct libmnt_fs *fs, const char *action) {
+    const char *source = mnt_fs_get_source(fs);
+    const char *target = mnt_fs_get_target(fs);
+    const char *fstype = mnt_fs_get_fstype(fs);
     
-    fp = setmntent("/proc/mounts", "r");
-    if (fp == NULL) {
-        perror("setmntent");
+    printf("%s: %s mounted at %s (type: %s)\n", 
+           action, 
+           source ? source : "unknown", 
+           target ? target : "unknown",
+           fstype ? fstype : "unknown");
+}
+
+// Compare two tables to find differences
+void compare_tables(struct libmnt_table *old_tab, struct libmnt_table *new_tab) {
+    struct libmnt_iter *iter;
+    struct libmnt_fs *fs;
+    int rc;
+    
+    iter = mnt_new_iter(MNT_ITER_FORWARD);
+    if (!iter) {
+        fprintf(stderr, "Failed to create iterator\n");
         return;
     }
     
-    printf("Current mounts:\n");
-    while ((mnt = getmntent(fp)) != NULL) {
-        printf("  %s on %s type %s\n", mnt->mnt_fsname, mnt->mnt_dir, mnt->mnt_type);
-    }
-    printf("\n");
-    
-    endmntent(fp);
-}
-
-int monitor_mounts_linux() {
-    int fd, wd;
-    char buffer[EVENT_BUF_LEN];
-    
-    fd = inotify_init();
-    if (fd < 0) {
-        perror("inotify_init");
-        return -1;
-    }
-    
-    wd = inotify_add_watch(fd, "/proc/mounts", IN_MODIFY);
-    if (wd < 0) {
-        perror("inotify_add_watch");
-        close(fd);
-        return -1;
-    }
-    
-    printf("Monitoring filesystem mounts on Linux...\n");
-    print_mounts();
-    
-    while (1) {
-        int length = read(fd, buffer, EVENT_BUF_LEN);
-        if (length < 0) {
-            perror("read");
-            break;
-        }
-        
-        int i = 0;
-        while (i < length) {
-            struct inotify_event *event = (struct inotify_event *)&buffer[i];
-            
-            if (event->mask & IN_MODIFY) {
-                printf("Mount table changed!\n");
-                print_mounts();
-            }
-            
-            i += EVENT_SIZE + event->len;
+    // Find new mounts (in new_tab but not in old_tab)
+    mnt_reset_iter(iter, MNT_ITER_FORWARD);
+    while ((rc = mnt_table_next_fs(new_tab, iter, &fs)) == 0) {
+        const char *target = mnt_fs_get_target(fs);
+        if (target && !mnt_table_find_target(old_tab, target, MNT_ITER_FORWARD)) {
+            print_mount_info(fs, "MOUNTED");
         }
     }
     
-    inotify_rm_watch(fd, wd);
-    close(fd);
-    return 0;
-}
-#endif
-
-#ifdef __FreeBSD__
-void print_mounts_freebsd() {
-    struct statfs *mounts;
-    int count, i;
-    
-    count = getmntinfo(&mounts, MNT_NOWAIT);
-    if (count == 0) {
-        perror("getmntinfo");
-        return;
-    }
-    
-    printf("Current mounts:\n");
-    for (i = 0; i < count; i++) {
-        printf("  %s on %s type %s\n", 
-               mounts[i].f_mntfromname, 
-               mounts[i].f_mntonname, 
-               mounts[i].f_fstypename);
-    }
-    printf("\n");
-}
-
-int monitor_mounts_freebsd() {
-    int kq, fd;
-    struct kevent change;
-    struct kevent event;
-    struct timespec timeout;
-    
-    kq = kqueue();
-    if (kq == -1) {
-        perror("kqueue");
-        return -1;
-    }
-    
-    // Monitor /dev for device changes (mount/unmount events)
-    fd = open("/dev", O_RDONLY);
-    if (fd == -1) {
-        perror("open /dev");
-        close(kq);
-        return -1;
-    }
-    
-    EV_SET(&change, fd, EVFILT_VNODE, EV_ADD | EV_ENABLE | EV_ONESHOT,
-           NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_REVOKE,
-           0, 0);
-    
-    if (kevent(kq, &change, 1, NULL, 0, NULL) == -1) {
-        perror("kevent register");
-        close(fd);
-        close(kq);
-        return -1;
-    }
-    
-    printf("Monitoring filesystem mounts on FreeBSD...\n");
-    print_mounts_freebsd();
-    
-    timeout.tv_sec = 1;
-    timeout.tv_nsec = 0;
-    
-    while (1) {
-        int nev = kevent(kq, NULL, 0, &event, 1, &timeout);
-        
-        if (nev == -1) {
-            perror("kevent wait");
-            break;
-        } else if (nev > 0) {
-            if (event.filter == EVFILT_VNODE) {
-                printf("Filesystem event detected!\n");
-                print_mounts_freebsd();
-                
-                // Re-register the event (ONESHOT means it's automatically removed)
-                EV_SET(&change, fd, EVFILT_VNODE, EV_ADD | EV_ENABLE | EV_ONESHOT,
-                       NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_REVOKE,
-                       0, 0);
-                
-                if (kevent(kq, &change, 1, NULL, 0, NULL) == -1) {
-                    perror("kevent re-register");
-                    break;
-                }
-            }
+    // Find removed mounts (in old_tab but not in new_tab)
+    mnt_reset_iter(iter, MNT_ITER_FORWARD);
+    while ((rc = mnt_table_next_fs(old_tab, iter, &fs)) == 0) {
+        const char *target = mnt_fs_get_target(fs);
+        if (target && !mnt_table_find_target(new_tab, target, MNT_ITER_FORWARD)) {
+            print_mount_info(fs, "UNMOUNTED");
         }
-        // If nev == 0, it's a timeout, continue monitoring
     }
     
-    close(fd);
-    close(kq);
-    return 0;
+    mnt_free_iter(iter);
 }
-#endif
+
+// Function to create a copy of a mount table
+struct libmnt_table *copy_table(struct libmnt_table *src) {
+    struct libmnt_table *dst;
+    struct libmnt_iter *iter;
+    struct libmnt_fs *fs;
+    int rc;
+    
+    dst = mnt_new_table();
+    if (!dst)
+        return NULL;
+    
+    iter = mnt_new_iter(MNT_ITER_FORWARD);
+    if (!iter) {
+        mnt_unref_table(dst);
+        return NULL;
+    }
+    
+    while ((rc = mnt_table_next_fs(src, iter, &fs)) == 0) {
+        struct libmnt_fs *new_fs = mnt_copy_fs(NULL, fs);
+        if (new_fs) {
+            mnt_table_add_fs(dst, new_fs);
+        }
+    }
+    
+    mnt_free_iter(iter);
+    return dst;
+}
 
 int main() {
-    printf("Filesystem Mount Detector\n");
-    printf("========================\n\n");
+    struct libmnt_monitor *monitor;
+    struct libmnt_table *table, *old_table;
+    int fd, rc;
     
-#ifdef __linux__
-    printf("Running on Linux\n\n");
-    return monitor_mounts_linux();
-#elif defined(__FreeBSD__)
-    printf("Running on FreeBSD\n\n");
-    return monitor_mounts_freebsd();
-#else
-    printf("Unsupported operating system\n");
-    printf("This program supports Linux and FreeBSD only.\n");
-    return 1;
-#endif
+    printf("libmount Filesystem Monitor\n");
+    printf("===========================\n\n");
+    
+    // Create monitor
+    monitor = mnt_new_monitor();
+    if (!monitor) {
+        fprintf(stderr, "Failed to create monitor\n");
+        return 1;
+    }
+    
+    // Enable monitoring of kernel mount table
+    rc = mnt_monitor_enable_kernel(monitor, 1);
+    if (rc < 0) {
+        fprintf(stderr, "Failed to enable kernel monitoring: %s\n", strerror(-rc));
+        mnt_unref_monitor(monitor);
+        return 1;
+    }
+    
+    // Get monitor file descriptor for polling
+    fd = mnt_monitor_get_fd(monitor);
+    if (fd < 0) {
+        fprintf(stderr, "Failed to get monitor file descriptor\n");
+        mnt_unref_monitor(monitor);
+        return 1;
+    }
+    
+    // Load initial mount table
+    table = mnt_new_table();
+    if (!table) {
+        fprintf(stderr, "Failed to create mount table\n");
+        mnt_unref_monitor(monitor);
+        return 1;
+    }
+    
+    rc = mnt_table_parse_mtab(table, NULL);
+    if (rc < 0) {
+        fprintf(stderr, "Failed to parse mount table: %s\n", strerror(-rc));
+        mnt_unref_table(table);
+        mnt_unref_monitor(monitor);
+        return 1;
+    }
+    
+    // Create a copy of the initial table
+    old_table = copy_table(table);
+    if (!old_table) {
+        fprintf(stderr, "Failed to copy initial mount table\n");
+        mnt_unref_table(table);
+        mnt_unref_monitor(monitor);
+        return 1;
+    }
+    
+    printf("Initial mount count: %d\n", mnt_table_get_nents(table));
+    printf("Monitoring for mount/unmount events...\n\n");
+    
+    // Main monitoring loop
+    while (1) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(fd, &fds);
+        
+        // Wait for events
+        rc = select(fd + 1, &fds, NULL, NULL, NULL);
+        if (rc < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("select");
+            break;
+        }
+        
+        if (FD_ISSET(fd, &fds)) {
+            // Check if there were changes
+            rc = mnt_monitor_event_cleanup(monitor);
+            if (rc < 0) {
+                fprintf(stderr, "Monitor cleanup failed: %s\n", strerror(-rc));
+                continue;
+            }
+            
+            // Reload the mount table
+            mnt_reset_table(table);
+            rc = mnt_table_parse_mtab(table, NULL);
+            if (rc < 0) {
+                fprintf(stderr, "Failed to reload mount table: %s\n", strerror(-rc));
+                continue;
+            }
+            
+            // Compare with old table to find changes
+            compare_tables(old_table, table);
+            
+            // Update old table
+            mnt_unref_table(old_table);
+            old_table = copy_table(table);
+            if (!old_table) {
+                fprintf(stderr, "Failed to update old table\n");
+                break;
+            }
+        }
+    }
+    
+    // Cleanup
+    mnt_unref_table(table);
+    mnt_unref_table(old_table);
+    mnt_unref_monitor(monitor);
+    
+    return 0;
 }
